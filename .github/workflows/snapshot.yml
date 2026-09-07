@@ -1,0 +1,87 @@
+name: Snapshot
+
+# Ported from JFrog Pipelines (EOL): release/pipelines.snapshot.yml,
+# pipeline "create_artifactory_jenkins_plugin_snapshot".
+# The original pipeline's jenkinsSnapshotGit GitRepo resource tracked branch "master"
+# (release/pipelines.resources.yml), so this triggers on push to master.
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+      JFROG_BUILD_STATUS: PASS
+      JFROG_CLI_BUILD_NAME: ecosystem-artifactory-jenkins-plugin-dev
+      JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+      JFROG_CLI_BUILD_PROJECT: ecosys
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "8"
+          distribution: "zulu"
+
+      # Replaces onStart: restore_cache_files / onComplete: add_cache_files from the
+      # original pipeline (actions/cache handles both restore and save in one step).
+      - name: Cache Maven local repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+
+      # Configure JFrog CLI
+      - name: Configure JFrog CLI
+        run: |
+          jf c rm --quiet
+          jf c add internal --url=${{ secrets.ARTIFACTORY_URL }} --user=${{ secrets.ARTIFACTORY_USER }} --password=${{ secrets.ARTIFACTORY_APIKEY }}
+          jf mvnc --repo-resolve-releases ecosys-jenkins-repos --repo-resolve-snapshots ecosys-releases-snapshots --repo-deploy-snapshots ecosys-oss-snapshot-local --repo-deploy-releases ecosys-oss-release-local
+
+      # Run audit
+      - name: Run audit
+        run: jf audit --fail=false
+
+      # Delete former snapshots to make sure the release bundle will not contain the same artifacts
+      - name: Delete former snapshots
+        run: jf rt del "ecosys-oss-snapshot-local/org/jenkins-ci/plugins/artifactory/*" --quiet
+
+      # Run install and publish
+      - name: Build, install and publish build-info
+        run: |
+          jf mvn clean install -U -B javadoc:jar source:jar
+          jf rt bag && jf rt bce
+          jf rt bp
+
+      # Distribute release bundle
+      - name: Distribute release bundle
+        run: |
+          jf ds rbc ecosystem-artifactory-jenkins-plugin-snapshot ${{ github.run_number }} --spec=./release/specs/dev-rbc-filespec.json --sign
+          jf ds rbd ecosystem-artifactory-jenkins-plugin-snapshot ${{ github.run_number }} --site="releases.jfrog.io" --sync
+
+      # Approximation of JFrog Pipelines' save_tests (which surfaced results in a "Tests" tab).
+      # GitHub Actions has no built-in equivalent; upload the raw reports as a build artifact.
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore

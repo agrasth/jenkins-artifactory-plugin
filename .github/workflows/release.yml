@@ -1,0 +1,134 @@
+name: Release
+
+# Ported from JFrog Pipelines (EOL): release/pipelines.release.yml, pipeline "release_jenkins".
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: "Version to release (e.g. 3.20.0)"
+        required: true
+      next_development_version:
+        description: "Next development version (e.g. 3.20.x-SNAPSHOT)"
+        required: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+      JFROG_BUILD_STATUS: PASS
+      JFROG_CLI_BUILD_NAME: ecosystem-artifactory-jenkins-plugin-release
+      JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+      JFROG_CLI_BUILD_PROJECT: ecosys
+      NEXT_VERSION: ${{ github.event.inputs.next_version }}
+      NEXT_DEVELOPMENT_VERSION: ${{ github.event.inputs.next_development_version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "8"
+          distribution: "zulu"
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+
+      # Configure git remotes and SSH access to the jenkinsci/artifactory-plugin upstream.
+      # NOTE: ssh-agent's env vars are exported to $GITHUB_ENV so the agent socket survives
+      # into later steps (each `run:` step is a fresh shell in GH Actions, unlike the single
+      # long-lived shell JFrog Pipelines gave the whole "Release" step).
+      - name: Configure git and SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.JENKINS_ID_RSA }}" > ~/.ssh/jenkins_id_rsa
+          chmod 600 ~/.ssh/jenkins_id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          eval "$(ssh-agent)"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          ssh-add ~/.ssh/jenkins_id_rsa
+
+          git config user.name "JFrog CI"
+          git config user.email "eco-system@jfrog.com"
+          git checkout master
+          git remote set-url origin https://${{ secrets.IL_AUTOMATION_TOKEN }}@github.com/jfrog/jenkins-artifactory-plugin.git
+          git remote add upstream git@github.com:jenkinsci/artifactory-plugin.git
+
+      # Make sure versions provided
+      - name: Verify version inputs
+        run: |
+          echo "Checking variables"
+          test -n "$NEXT_VERSION" -a "$NEXT_VERSION" != "0.0.0"
+          test -n "$NEXT_DEVELOPMENT_VERSION" -a "$NEXT_DEVELOPMENT_VERSION" != "0.0.0"
+
+      # Configure JFrog CLI
+      - name: Configure JFrog CLI
+        run: |
+          jf c rm --quiet
+          jf c add internal --url=${{ secrets.ARTIFACTORY_URL }} --user=${{ secrets.ARTIFACTORY_USER }} --password=${{ secrets.ARTIFACTORY_APIKEY }}
+          jf mvnc --repo-resolve-releases ecosys-jenkins-repos --repo-resolve-snapshots ecosys-releases-snapshots --repo-deploy-snapshots ecosys-oss-snapshot-local --repo-deploy-releases ecosys-oss-release-local
+
+      # Run audit
+      - name: Run audit
+        run: jf audit --fail=false
+
+      # Update version
+      - name: Update version and tag release
+        run: |
+          jf mvn versions:set -DnewVersion="${NEXT_VERSION}" -B
+          git commit -am "[artifactory-release] Release version ${NEXT_VERSION} [skipRun]" --allow-empty
+          git tag artifactory-${NEXT_VERSION}
+
+      # Run install and publish
+      - name: Build, install and publish build-info
+        run: |
+          jf mvn clean install -U -B -DskipTests
+          jf rt bag && jf rt bce
+          jf rt bp
+
+      # Distribute release bundle
+      - name: Distribute release bundle
+        run: |
+          jf ds rbc ecosystem-artifactory-jenkins-plugin $NEXT_VERSION --spec=./release/specs/prod-rbc-filespec.json --spec-vars="version=$NEXT_VERSION" --sign
+          jf ds rbd ecosystem-artifactory-jenkins-plugin $NEXT_VERSION --site="releases.jfrog.io" --sync
+
+      # Upload plugin to Jenkins Artifactory server
+      - name: Upload plugin to Jenkins Artifactory server
+        run: |
+          jf c add jenkins --url=${{ secrets.JENKINS_ARTIFACTORY_URL }} --user=${{ secrets.JENKINS_ARTIFACTORY_USER }} --password=${{ secrets.JENKINS_ARTIFACTORY_PASSWORD }} --enc-password=false
+          jf mvnc --server-id-resolve internal --repo-resolve-releases ecosys-jenkins-repos --repo-resolve-snapshots ecosys-releases-snapshots --server-id-deploy jenkins --repo-deploy-releases releases --repo-deploy-snapshots snapshots
+          jf mvn clean install -U -B -DskipTests
+
+      # Update next development version
+      - name: Update next development version
+        run: |
+          jf mvn versions:set -DnewVersion=$NEXT_DEVELOPMENT_VERSION -B
+          git commit -am "[artifactory-release] Next development version [skipRun]"
+
+      # Push changes
+      - name: Push changes
+        run: |
+          git push
+          git push --tags
+          git push upstream master
+          git push upstream master --tags
+
+      # Approximation of JFrog Pipelines' save_tests (which surfaced results in a "Tests" tab).
+      # GitHub Actions has no built-in equivalent; upload the raw reports as a build artifact.
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore
