@@ -48,33 +48,16 @@ jobs:
       - name: Setup JFrog CLI
         uses: jfrog/setup-jfrog-cli@v4
 
-      # Configure JFrog CLI
-      - name: Configure JFrog CLI
-        run: |
-          jf c rm --quiet
-          jf c add internal --url=${{ secrets.ARTIFACTORY_URL }} --user=${{ secrets.ARTIFACTORY_USER }} --password=${{ secrets.ARTIFACTORY_APIKEY }}
-          jf mvnc --repo-resolve-releases ecosys-jenkins-repos --repo-resolve-snapshots ecosys-releases-snapshots --repo-deploy-snapshots ecosys-oss-snapshot-local --repo-deploy-releases ecosys-oss-release-local
-
-      # Run audit
-      - name: Run audit
-        run: jf audit --fail=false
-
-      # Delete former snapshots to make sure the release bundle will not contain the same artifacts
-      - name: Delete former snapshots
-        run: jf rt del "ecosys-oss-snapshot-local/org/jenkins-ci/plugins/artifactory/*" --quiet
-
-      # Run install and publish
-      - name: Build, install and publish build-info
-        run: |
-          jf mvn clean install -U -B javadoc:jar source:jar
-          jf rt bag && jf rt bce
-          jf rt bp
-
-      # Distribute release bundle
-      - name: Distribute release bundle
-        run: |
-          jf ds rbc ecosystem-artifactory-jenkins-plugin-snapshot ${{ github.run_number }} --spec=./release/specs/dev-rbc-filespec.json --sign
-          jf ds rbd ecosystem-artifactory-jenkins-plugin-snapshot ${{ github.run_number }} --site="releases.jfrog.io" --sync
+      # Configures the JFrog CLI, runs an audit, cleans up former snapshots, and runs the
+      # install, publish and distribute steps. See .github/scripts/snapshot.sh - it is also
+      # runnable standalone on a developer machine (export the same env vars, then run the
+      # script).
+      - name: Run snapshot
+        env:
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+          ARTIFACTORY_APIKEY: ${{ secrets.ARTIFACTORY_APIKEY }}
+        run: .github/scripts/snapshot.sh
 
       # Approximation of JFrog Pipelines' save_tests (which surfaced results in a "Tests" tab).
       # GitHub Actions has no built-in equivalent; upload the raw reports as a build artifact.
